@@ -15,6 +15,7 @@ Works generically across any dataset with the standard schema.
 """
 
 import re
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Optional, Set
@@ -41,6 +42,80 @@ class TestContext:
     test_nodes: List[Dict]
     repo: str
     base_commit: str
+
+    def save(self, path: str) -> None:
+        """Save subgraph to JSON for debugging.
+
+        Args:
+            path: File path to write JSON to (e.g. 'subgraph_debug.json').
+        """
+        data = {
+            'repo': self.repo,
+            'base_commit': self.base_commit,
+            'seeds': self.seeds,
+            'context_nodes': self.context_nodes,
+            'edges': self.edges,
+            'test_nodes': self.test_nodes,
+            'stats': {
+                'num_seeds': len(self.seeds),
+                'num_context_nodes': len(self.context_nodes),
+                'num_edges': len(self.edges),
+                'num_test_nodes': len(self.test_nodes),
+            }
+        }
+        Path(path).write_text(json.dumps(data, indent=2))
+        print(f"✓ Saved subgraph to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'TestContext':
+        """Load subgraph from JSON.
+
+        Args:
+            path: File path to read JSON from.
+
+        Returns:
+            Reconstructed TestContext instance.
+        """
+        data = json.loads(Path(path).read_text())
+        return cls(
+            seeds=data['seeds'],
+            context_nodes=data['context_nodes'],
+            edges=data['edges'],
+            test_nodes=data['test_nodes'],
+            repo=data['repo'],
+            base_commit=data['base_commit'],
+        )
+
+    def summary(self) -> str:
+        """Return a human-readable summary of the subgraph.
+
+        Returns:
+            Formatted string with counts and top nodes.
+        """
+        lines = [
+            f"TestContext: {self.repo} @ {self.base_commit[:8]}",
+            f"  Seeds: {len(self.seeds)}",
+            f"  Context nodes: {len(self.context_nodes)}",
+            f"  Edges: {len(self.edges)}",
+            f"  Test nodes: {len(self.test_nodes)}",
+            f"",
+            "Top seeds:",
+        ]
+        for node in self.seeds[:5]:
+            lines.append(f"  - {node['label']:40} ({node['type']})")
+        if len(self.seeds) > 5:
+            lines.append(f"  ... and {len(self.seeds) - 5} more")
+
+        lines.append("")
+        lines.append("Edge types:")
+        edge_types = {}
+        for edge in self.edges:
+            rel = edge['relation']
+            edge_types[rel] = edge_types.get(rel, 0) + 1
+        for rel, count in sorted(edge_types.items(), key=lambda x: -x[1]):
+            lines.append(f"  {rel:20} {count:5}")
+
+        return "\n".join(lines)
 
 
 class PatchParser:
@@ -162,14 +237,15 @@ class TestContextExtractor:
                 - test_file: Relative path to test file (e.g. 'tests/test_sessions.py')
             depth: BFS depth for context expansion (default 2).
             edge_filter: Set of edge relations to traverse during BFS.
-                        If None, uses smart defaults (contains, calls, inherits,
-                        tests, uses, depends_on).
+                        If None, uses smart defaults: contains, calls, inherits, tests, uses.
+                        Excludes depends_on (imports) as it is primarily noise for test generation.
 
         Returns:
             TestContext with seeds, context_nodes, edges, test_nodes.
         """
         if edge_filter is None:
-            edge_filter = {'contains', 'calls', 'inherits', 'tests', 'uses', 'depends_on'}
+            # Exclude depends_on (imports) as noise; include structural edges only
+            edge_filter = {'contains', 'calls', 'inherits', 'tests', 'uses'}
 
         # Extract changed function/class names from the patch
         changed_names = self.patch_parser.extract_changed_functions(
