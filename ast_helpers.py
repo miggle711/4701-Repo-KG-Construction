@@ -319,10 +319,13 @@ def _get_return_types(func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -
     when there is no return annotation.
 
     Examples:
-        return None        → 'None'
-        return self        → 'self'
-        return []          → 'list'
-        return response    → 'response' (name, resolved by test generator)
+        return None                        → 'None'
+        return self                        → 'self'
+        return []                          → 'list'
+        return (a, b, c)                   → '(a, b, c)'
+        return response                    → 'response' (name, resolved by test generator)
+        return x > 5                       → 'bool'
+        return (x for x in items)          → 'generator'
     """
     return_types: List[str] = []
 
@@ -340,16 +343,39 @@ def _get_return_types(func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -
                 return_types.append('None')
             elif isinstance(child.value, ast.Constant) and child.value.value is None:
                 return_types.append('None')
-            elif isinstance(child.value, (ast.List, ast.ListComp)):
+            elif isinstance(child.value, ast.ListComp):
                 return_types.append('list')
-            elif isinstance(child.value, (ast.Dict, ast.DictComp)):
+            elif isinstance(child.value, ast.List):
+                unparsed = _safe_unparse(child.value)
+                return_types.append(unparsed or 'list')
+            elif isinstance(child.value, ast.DictComp):
                 return_types.append('dict')
-            elif isinstance(child.value, (ast.Set, ast.SetComp)):
+            elif isinstance(child.value, ast.Dict):
+                unparsed = _safe_unparse(child.value)
+                return_types.append(unparsed or 'dict')
+            elif isinstance(child.value, ast.SetComp):
                 return_types.append('set')
+            elif isinstance(child.value, ast.Set):
+                unparsed = _safe_unparse(child.value)
+                return_types.append(unparsed or 'set')
             elif isinstance(child.value, ast.Tuple):
-                return_types.append('tuple')
+                unparsed = _safe_unparse(child.value)
+                return_types.append(unparsed or 'tuple')
             elif isinstance(child.value, ast.Constant):
                 return_types.append(type(child.value.value).__name__)
+            elif isinstance(child.value, ast.Compare):
+                return_types.append('bool')
+            elif isinstance(child.value, ast.BoolOp):
+                return_types.append('bool')
+            elif isinstance(child.value, ast.UnaryOp) and isinstance(child.value.op, ast.Not):
+                return_types.append('bool')
+            elif isinstance(child.value, ast.GeneratorExp):
+                return_types.append('generator')
+            elif isinstance(child.value, ast.Lambda):
+                return_types.append('function')
+            elif isinstance(child.value, (ast.BinOp, ast.UnaryOp)):
+                unparsed = _safe_unparse(child.value)
+                return_types.append(unparsed or 'numeric')
             else:
                 unparsed = _safe_unparse(child.value)
                 if unparsed:
