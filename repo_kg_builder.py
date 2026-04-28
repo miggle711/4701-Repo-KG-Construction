@@ -644,6 +644,61 @@ class RepoASTParser:
                                 )))
                     break
 
+        # --- Add call context metadata to function nodes ---
+        # Build caller map: target_node_id → [source_node_ids calling it]
+        callers: Dict[str, List[str]] = defaultdict(list)
+        for edge in all_edges:
+            if edge['relation'] == 'calls':
+                callers[edge['target']].append(edge['source'])
+
+        # Build node_id → node dict for quick lookup
+        node_by_id = {node['id']: node for node in all_nodes}
+
+        # Annotate each function/method with call context
+        for node in all_nodes:
+            if node['type'] not in ('function', 'method', 'test_function'):
+                continue
+
+            node_id = node['id']
+            caller_ids = callers.get(node_id, [])
+            caller_count = len(caller_ids)
+
+            # Build direct_callers list with caller details
+            direct_callers = []
+            for caller_id in caller_ids:
+                caller_node = node_by_id.get(caller_id)
+                if caller_node:
+                    direct_callers.append({
+                        'id': caller_id,
+                        'label': caller_node['label'],
+                        'type': caller_node['type'],
+                    })
+
+            # Compute call importance based on caller diversity
+            # High: called from many different functions/classes
+            # Medium: called from a few places
+            # Low: internal only (1-2 callers)
+            if caller_count == 0:
+                importance = 'internal'
+            elif caller_count <= 2:
+                importance = 'low'
+            elif caller_count <= 10:
+                importance = 'medium'
+            else:
+                importance = 'high'
+
+            # Check if this is a public API (exported or called externally)
+            is_public = (
+                node['metadata'].get('name', node['label']) in
+                node['metadata'].get('exports', [])
+            ) or caller_count >= 5
+
+            # Add call context to metadata
+            node['metadata']['caller_count'] = caller_count
+            node['metadata']['direct_callers'] = direct_callers
+            node['metadata']['call_importance'] = importance
+            node['metadata']['is_public_api'] = is_public
+
         return {
             'nodes': all_nodes,
             'edges': all_edges,
