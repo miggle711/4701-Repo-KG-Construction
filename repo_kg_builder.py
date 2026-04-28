@@ -397,17 +397,38 @@ class RepoASTParser:
         """Walk repo_dir, parse all .py files in parallel, and return the KG dict.
 
         Two-pass algorithm:
-            Pass 1 (parallel): Each file is parsed independently, emitting nodes
-                and unresolved call/inherits edges where targets are name strings.
-            Pass 2 (sequential): Build a global name→id index from all nodes,
-                then resolve unresolved edges to actual node IDs.
+            Pass 1 (parallel): Each file parsed independently, emitting nodes
+                and unresolved call/inherits edges (targets as name strings).
+            Pass 2 (sequential): Aggregate nodes, build name→id indices,
+                resolve edges, add call context.
 
         Args:
-            repo: Repository name used as namespace in node IDs (e.g. 'psf/requests').
-            repo_dir: Root of the extracted source tree.
+            repo: Repository name (e.g. 'psf/requests').
+            repo_dir: Root of extracted source tree.
 
         Returns:
             KG dict: {'nodes': [...], 'edges': [...], 'metadata': {...}}
+        """
+        file_args = self._collect_files(repo, repo_dir)
+        results = self._run_parallel_parse(file_args)
+        all_nodes, all_edges, indices = self._aggregate_and_index(results)
+        all_edges = self._resolve_edges(all_nodes, all_edges, indices)
+        self._add_call_context(all_nodes, all_edges)
+
+        return {
+            'nodes': all_nodes,
+            'edges': all_edges,
+            'metadata': {
+                'repo': repo,
+                'file_count': len(file_args),
+                'parse_mode': 'source',
+            }
+        }
+
+    def _collect_files(self, repo: str, repo_dir: Path) -> List[Tuple[str, str, str]]:
+        """Collect all Python files to parse, excluding SKIP_DIRS.
+
+        Returns list of (repo, rel_path, abs_path) tuples.
         """
         file_args = []
         for py_file in repo_dir.rglob('*.py'):
@@ -415,7 +436,13 @@ class RepoASTParser:
             if any(part in SKIP_DIRS for part in rel.parts):
                 continue
             file_args.append((repo, str(rel), str(py_file)))
+        return file_args
 
+    def _run_parallel_parse(self, file_args: List[Tuple[str, str, str]]) -> List[Dict]:
+        """Run _parse_file in parallel via ProcessPoolExecutor.
+
+        Returns list of parse results (nodes + unresolved edges from each file).
+        """
         results = []
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(_parse_file, args): args for args in file_args}
@@ -423,20 +450,20 @@ class RepoASTParser:
                 result = future.result()
                 if result:
                     results.append(result)
+        return results
 
-        # --- Pass 2: aggregate nodes and build resolution indices ---
+    def _aggregate_and_index(self, results: List[Dict]) -> Tuple[List[Dict], List[Dict], Dict]:
+        """Aggregate nodes from parse results and build resolution indices.
+
+        Returns (all_nodes, all_edges, indices_dict) where indices_dict contains:
+            - label_to_ids, class_label_to_ids, class_method_to_ids,
+            - qualified_to_ids, nodes_by_id
+        """
         all_nodes: List[Dict] = []
         seen_node_ids: Set[str] = set()
-        # Maps function/method label → list of node IDs (multiple if name is shared)
         label_to_ids: Dict[str, List[str]] = defaultdict(list)
-        # Separate index for class nodes used in inheritance resolution
         class_label_to_ids: Dict[str, List[str]] = defaultdict(list)
-        # (class_name, method_name) → method node IDs — used for self.method and
-        # local-type-hint resolution. A class can technically appear in multiple
-        # files (overloaded across modules), so the value is a list.
         class_method_to_ids: Dict[Tuple[str, str], List[str]] = defaultdict(list)
-        # Fully-qualified path 'pkg.mod.Thing' → node ID(s). Lets us resolve
-        # imports directly when the import_map gave us a qualified target.
         qualified_to_ids: Dict[str, List[str]] = defaultdict(list)
 
         for result in results:
@@ -454,8 +481,6 @@ class RepoASTParser:
                     elif ntype == 'class':
                         class_label_to_ids[label].append(node['id'])
 
-                    # Index by qualified path: filepath without .py + label.
-                    # 'requests/auth.py' + 'HTTPBasicAuth' → 'requests.auth.HTTPBasicAuth'
                     fp = node.get('metadata', {}).get('filepath')
                     if fp and ntype in ('function', 'method', 'class', 'test_function'):
                         mod = fp.removesuffix('.py').replace('/', '.')
@@ -465,19 +490,33 @@ class RepoASTParser:
                             qualified_to_ids[f"{mod}.{parent}.{label}"].append(node['id'])
 
         nodes_by_id: Dict[str, Dict] = {n['id']: n for n in all_nodes}
+        all_edges: List[Dict] = [edge for result in results for edge in result['edges']]
+
+        indices = {
+            'label_to_ids': label_to_ids,
+            'class_label_to_ids': class_label_to_ids,
+            'class_method_to_ids': class_method_to_ids,
+            'qualified_to_ids': qualified_to_ids,
+            'nodes_by_id': nodes_by_id,
+        }
+
+        return all_nodes, all_edges, indices
+
+    def _resolve_edges(self, all_nodes: List[Dict], all_edges: List[Dict], indices: Dict) -> List[Dict]:
+        """Resolve unresolved edges using name→id indices.
+
+        Processes 'calls', 'inherits', 'tests', 'uses', 'overrides' edges.
+        Drops reads/writes/returns edges (attribute strings, not node IDs).
+        Returns resolved edge list.
+        """
+        label_to_ids = indices['label_to_ids']
+        class_label_to_ids = indices['class_label_to_ids']
+        class_method_to_ids = indices['class_method_to_ids']
+        qualified_to_ids = indices['qualified_to_ids']
+        nodes_by_id = indices['nodes_by_id']
 
         def _resolve_call(meta: Dict, callee_name: str) -> Tuple[List[str], str]:
-            """Resolve a call-edge target using the metadata hints.
-
-            Returns (matched_node_ids, confidence_label). Tries hints in order:
-                1. class_hint: self.method() inside a method of class C → C.method
-                2. local_type_hint: x.method() where x = SomeClass() → SomeClass.method
-                3. import_resolved: bare or receiver-qualified name found via imports
-                4. fallback: bare name lookup (the original ambiguous behavior)
-
-            Confidence is 'qualified' for hits 1-3 (high precision, single owner)
-            and 'exact'/'ambiguous' for the bare-name fallback.
-            """
+            """Resolve a call-edge target using the metadata hints."""
             class_hint = meta.get('class_hint')
             if class_hint:
                 hits = class_method_to_ids.get((class_hint, callee_name), [])
@@ -495,8 +534,6 @@ class RepoASTParser:
                 hits = qualified_to_ids.get(qualified, [])
                 if hits:
                     return hits, 'qualified'
-                # Try just the last component as a class qualifier:
-                # 'pkg.mod.Foo.bar' → look up ('Foo', 'bar')
                 parts = qualified.rsplit('.', 2)
                 if len(parts) == 3:
                     hits = class_method_to_ids.get((parts[1], parts[2]), [])
@@ -508,118 +545,107 @@ class RepoASTParser:
                 return [], 'unresolved'
             return hits, 'exact' if len(hits) == 1 else 'ambiguous'
 
-        # --- Pass 2: resolve edges ---
-        all_edges: List[Dict] = []
+        resolved_edges: List[Dict] = []
         seen_edges: Set[Tuple] = set()
 
-        for result in results:
-            for edge in result['edges']:
-                meta = edge.get('metadata', {})
+        for edge in all_edges:
+            meta = edge.get('metadata', {})
 
-                if edge['relation'] == 'calls' and meta.get('unresolved'):
-                    # Replace callee name string with actual node ID(s)
-                    callee_name = edge['target']
-                    matches, confidence = _resolve_call(meta, callee_name)
-                    if not matches:
-                        # External library call — no node in repo, drop the edge
-                        continue
-                    for target_id in matches:
-                        key = (edge['source'], target_id, 'calls')
-                        if key not in seen_edges:
-                            seen_edges.add(key)
-                            all_edges.append(asdict(KGEdge(
-                                source=edge['source'], target=target_id, relation='calls',
-                                metadata={'confidence': confidence,
-                                          'import_resolved': meta.get('import_resolved')}
-                            )))
-
-                elif edge['relation'] == 'inherits' and meta.get('unresolved'):
-                    # Base names may be dotted (pkg.Base) — take the last component
-                    base_name = edge['target'].split('.')[-1]
-                    matches = class_label_to_ids.get(base_name, [])
-                    if not matches:
-                        continue
-                    confidence = 'exact' if len(matches) == 1 else 'ambiguous'
-                    for target_id in matches:
-                        key = (edge['source'], target_id, 'inherits')
-                        if key not in seen_edges:
-                            seen_edges.add(key)
-                            all_edges.append(asdict(KGEdge(
-                                source=edge['source'], target=target_id, relation='inherits',
-                                metadata={'confidence': confidence}
-                            )))
-
-                elif edge['relation'] == 'tests' and meta.get('unresolved'):
-                    # Resolve test function → target function by name
-                    target_name = edge['target']
-                    # Strip 'test_' prefix to find candidate (stored as original func name)
-                    if target_name.startswith('test_'):
-                        target_name = target_name[5:]
-                    matches = label_to_ids.get(target_name, [])
-                    if not matches:
-                        continue
-                    confidence = 'exact' if len(matches) == 1 else 'ambiguous'
-                    for target_id in matches:
-                        key = (edge['source'], target_id, 'tests')
-                        if key not in seen_edges:
-                            seen_edges.add(key)
-                            all_edges.append(asdict(KGEdge(
-                                source=edge['source'], target=target_id, relation='tests',
-                                metadata={'confidence': confidence}
-                            )))
-
-                elif edge['relation'] == 'uses' and meta.get('unresolved'):
-                    # class → uses → class: resolve instantiated class name to class node ID
-                    matches = class_label_to_ids.get(edge['target'], [])
-                    if not matches:
-                        continue
-                    confidence = 'exact' if len(matches) == 1 else 'ambiguous'
-                    for target_id in matches:
-                        key = (edge['source'], target_id, 'uses')
-                        if key not in seen_edges:
-                            seen_edges.add(key)
-                            all_edges.append(asdict(KGEdge(
-                                source=edge['source'], target=target_id, relation='uses',
-                                metadata={'confidence': confidence}
-                            )))
-
-                elif edge['relation'] == 'overrides' and meta.get('unresolved'):
-                    # method → overrides → parent method: target is "BaseClass.method_name"
-                    parts = edge['target'].rsplit('.', 1)
-                    if len(parts) != 2:
-                        continue
-                    base_name, method_name = parts
-                    base_simple = base_name.split('.')[-1]
-                    if class_label_to_ids.get(base_simple):
-                        for target_id in label_to_ids.get(method_name, []):
-                            node = nodes_by_id.get(target_id, {})
-                            if node.get('metadata', {}).get('class') == base_simple:
-                                key = (edge['source'], target_id, 'overrides')
-                                if key not in seen_edges:
-                                    seen_edges.add(key)
-                                    all_edges.append(asdict(KGEdge(
-                                        source=edge['source'], target=target_id,
-                                        relation='overrides'
-                                    )))
-
-                elif meta.get('unresolved'):
-                    # reads/writes/returns reference attribute strings, not node IDs — drop
+            if edge['relation'] == 'calls' and meta.get('unresolved'):
+                callee_name = edge['target']
+                matches, confidence = _resolve_call(meta, callee_name)
+                if not matches:
                     continue
-
-                else:
-                    key = (edge['source'], edge['target'], edge['relation'])
+                for target_id in matches:
+                    key = (edge['source'], target_id, 'calls')
                     if key not in seen_edges:
                         seen_edges.add(key)
-                        all_edges.append(edge)
+                        resolved_edges.append(asdict(KGEdge(
+                            source=edge['source'], target=target_id, relation='calls',
+                            metadata={'confidence': confidence,
+                                      'import_resolved': meta.get('import_resolved')}
+                        )))
 
-        # module_depends_on: file → file edges derived from file→imports→import chains
-        # Build: import_id → [file_id that imports it], file_label → file_id
+            elif edge['relation'] == 'inherits' and meta.get('unresolved'):
+                base_name = edge['target'].split('.')[-1]
+                matches = class_label_to_ids.get(base_name, [])
+                if not matches:
+                    continue
+                confidence = 'exact' if len(matches) == 1 else 'ambiguous'
+                for target_id in matches:
+                    key = (edge['source'], target_id, 'inherits')
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        resolved_edges.append(asdict(KGEdge(
+                            source=edge['source'], target=target_id, relation='inherits',
+                            metadata={'confidence': confidence}
+                        )))
+
+            elif edge['relation'] == 'tests' and meta.get('unresolved'):
+                target_name = edge['target']
+                if target_name.startswith('test_'):
+                    target_name = target_name[5:]
+                matches = label_to_ids.get(target_name, [])
+                if not matches:
+                    continue
+                confidence = 'exact' if len(matches) == 1 else 'ambiguous'
+                for target_id in matches:
+                    key = (edge['source'], target_id, 'tests')
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        resolved_edges.append(asdict(KGEdge(
+                            source=edge['source'], target=target_id, relation='tests',
+                            metadata={'confidence': confidence}
+                        )))
+
+            elif edge['relation'] == 'uses' and meta.get('unresolved'):
+                matches = class_label_to_ids.get(edge['target'], [])
+                if not matches:
+                    continue
+                confidence = 'exact' if len(matches) == 1 else 'ambiguous'
+                for target_id in matches:
+                    key = (edge['source'], target_id, 'uses')
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        resolved_edges.append(asdict(KGEdge(
+                            source=edge['source'], target=target_id, relation='uses',
+                            metadata={'confidence': confidence}
+                        )))
+
+            elif edge['relation'] == 'overrides' and meta.get('unresolved'):
+                parts = edge['target'].rsplit('.', 1)
+                if len(parts) != 2:
+                    continue
+                base_name, method_name = parts
+                base_simple = base_name.split('.')[-1]
+                if class_label_to_ids.get(base_simple):
+                    for target_id in label_to_ids.get(method_name, []):
+                        node = nodes_by_id.get(target_id, {})
+                        if node.get('metadata', {}).get('class') == base_simple:
+                            key = (edge['source'], target_id, 'overrides')
+                            if key not in seen_edges:
+                                seen_edges.add(key)
+                                resolved_edges.append(asdict(KGEdge(
+                                    source=edge['source'], target=target_id,
+                                    relation='overrides'
+                                )))
+
+            elif meta.get('unresolved'):
+                continue
+
+            else:
+                key = (edge['source'], edge['target'], edge['relation'])
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    resolved_edges.append(edge)
+
+        # Add module_depends_on edges
         file_label_to_id: Dict[str, str] = {
             n['label']: n['id'] for n in all_nodes
             if n['type'] in ('file', 'test_file')
         }
         import_to_files: Dict[str, List[str]] = defaultdict(list)
-        for edge in all_edges:
+        for edge in resolved_edges:
             if edge['relation'] == 'imports':
                 import_to_files[edge['target']].append(edge['source'])
 
@@ -627,7 +653,6 @@ class RepoASTParser:
             if imp_node['type'] != 'import':
                 continue
             module = imp_node['metadata'].get('module', '')
-            # Map dotted module path to a file node: 'requests.sessions' → 'sessions.py'
             parts = (module or imp_node['label']).split('.')
             for i in range(len(parts), 0, -1):
                 candidate = parts[i - 1] + '.py'
@@ -638,23 +663,23 @@ class RepoASTParser:
                             key = (src_file_id, target_file_id, 'module_depends_on')
                             if key not in seen_edges:
                                 seen_edges.add(key)
-                                all_edges.append(asdict(KGEdge(
+                                resolved_edges.append(asdict(KGEdge(
                                     source=src_file_id, target=target_file_id,
                                     relation='module_depends_on'
                                 )))
                     break
 
-        # --- Add call context metadata to function nodes ---
-        # Build caller map: target_node_id → [source_node_ids calling it]
+        return resolved_edges
+
+    def _add_call_context(self, all_nodes: List[Dict], all_edges: List[Dict]) -> None:
+        """Annotate functions with caller_count and direct_callers metadata."""
         callers: Dict[str, List[str]] = defaultdict(list)
         for edge in all_edges:
             if edge['relation'] == 'calls':
                 callers[edge['target']].append(edge['source'])
 
-        # Build node_id → node dict for quick lookup
         node_by_id = {node['id']: node for node in all_nodes}
 
-        # Annotate each function/method with call context
         for node in all_nodes:
             if node['type'] not in ('function', 'method', 'test_function'):
                 continue
@@ -663,7 +688,6 @@ class RepoASTParser:
             caller_ids = callers.get(node_id, [])
             caller_count = len(caller_ids)
 
-            # Build direct_callers list with caller details
             direct_callers = []
             for caller_id in caller_ids:
                 caller_node = node_by_id.get(caller_id)
@@ -674,40 +698,8 @@ class RepoASTParser:
                         'type': caller_node['type'],
                     })
 
-            # Compute call importance based on caller diversity
-            # High: called from many different functions/classes
-            # Medium: called from a few places
-            # Low: internal only (1-2 callers)
-            if caller_count == 0:
-                importance = 'internal'
-            elif caller_count <= 2:
-                importance = 'low'
-            elif caller_count <= 10:
-                importance = 'medium'
-            else:
-                importance = 'high'
-
-            # Check if this is a public API (exported or called externally)
-            is_public = (
-                node['metadata'].get('name', node['label']) in
-                node['metadata'].get('exports', [])
-            ) or caller_count >= 5
-
-            # Add call context to metadata
             node['metadata']['caller_count'] = caller_count
             node['metadata']['direct_callers'] = direct_callers
-            node['metadata']['call_importance'] = importance
-            node['metadata']['is_public_api'] = is_public
-
-        return {
-            'nodes': all_nodes,
-            'edges': all_edges,
-            'metadata': {
-                'repo': repo,
-                'file_count': len(file_args),
-                'parse_mode': 'source',
-            }
-        }
 
 
 # ---------------------------------------------------------------------------
