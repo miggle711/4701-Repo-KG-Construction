@@ -265,6 +265,62 @@ def _get_exceptions(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
     return {'raises': list(set(raises)), 'catches': list(set(catches))}
 
 
+def _extract_conditions(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> List[Dict]:
+    """Extract boundary conditions from if, while, and assert statements.
+
+    Returns a list of {type, condition, lineno} dicts representing the conditions
+    that guard behavior in the function. Used for test generation to identify
+    edge cases and boundary values to test.
+
+    Does NOT descend into nested function scopes to avoid capturing conditions
+    from helper functions defined within the target function.
+
+    Examples:
+        if x < 0: ... → {type: 'if', condition: 'x < 0', lineno: 5}
+        while y > 100: ... → {type: 'while', condition: 'y > 100', lineno: 10}
+        assert z != 0 → {type: 'assert', condition: 'z != 0', lineno: 15}
+    """
+    conditions: List[Dict] = []
+    seen: Set[Tuple[str, int]] = set()
+
+    def _walk_no_nested(n: ast.AST) -> None:
+        """Recursively extract conditions, stopping at nested function definitions."""
+        for child in ast.iter_child_nodes(n):
+            # Skip nested function scopes entirely
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+
+            if isinstance(child, ast.If):
+                unparsed = _safe_unparse(child.test)
+                if unparsed:
+                    key = ('if', child.lineno)
+                    if key not in seen:
+                        seen.add(key)
+                        conditions.append({'type': 'if', 'condition': unparsed, 'lineno': child.lineno})
+
+            elif isinstance(child, ast.While):
+                unparsed = _safe_unparse(child.test)
+                if unparsed:
+                    key = ('while', child.lineno)
+                    if key not in seen:
+                        seen.add(key)
+                        conditions.append({'type': 'while', 'condition': unparsed, 'lineno': child.lineno})
+
+            elif isinstance(child, ast.Assert):
+                unparsed = _safe_unparse(child.test)
+                if unparsed:
+                    key = ('assert', child.lineno)
+                    if key not in seen:
+                        seen.add(key)
+                        conditions.append({'type': 'assert', 'condition': unparsed, 'lineno': child.lineno})
+
+            # Recurse into this child (will skip nested functions)
+            _walk_no_nested(child)
+
+    _walk_no_nested(node)
+    return conditions
+
+
 def _count_branches(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> int:
     """Count control flow branches (if/for/while) in this function only.
 
@@ -698,6 +754,7 @@ def _build_func_metadata(
         'catches': exc['catches'],
         'is_async': isinstance(func_node, ast.AsyncFunctionDef),
         'branches': _count_branches(func_node),
+        'conditions': _extract_conditions(func_node),
         # Populated for anything in a test file — covers test functions and
         # their helper classes (e.g. DomDocument.get_unique_child in pytest).
         # Production code is skipped to avoid noise from invariant asserts.
