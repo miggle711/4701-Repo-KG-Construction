@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Set
 from collections import deque
 
-from kg_query import KGQueryEngine
+from kg_construction.kg.query import KGQueryEngine
 
 
 @dataclass
