@@ -225,6 +225,7 @@ class TestContextExtractor:
         instance: Dict,
         depth: int = 2,
         edge_filter: Optional[Set[str]] = None,
+        include_seed_imports: bool = True,
     ) -> TestContext:
         """Extract a KG subgraph from a dataset instance.
 
@@ -239,6 +240,8 @@ class TestContextExtractor:
             edge_filter: Set of edge relations to traverse during BFS.
                         If None, uses smart defaults: contains, calls, inherits, tests, uses.
                         Excludes depends_on (imports) as it is primarily noise for test generation.
+            include_seed_imports: If True (default), add depends_on edges from seed nodes only.
+                        This keeps subgraph small (~10-15% larger) while enabling import validation.
 
         Returns:
             TestContext with seeds, context_nodes, edges, test_nodes.
@@ -288,6 +291,28 @@ class TestContextExtractor:
             depth=depth,
             edge_filter=edge_filter
         )
+
+        # Optionally add depends_on edges from seed nodes only (for import validation)
+        if include_seed_imports:
+            seen_node_ids = {n['id'] for n in subgraph_nodes}
+            seen_edge_keys = {(e['source'], e['target'], e['relation']) for e in subgraph_edges}
+
+            for seed_id in seed_ids:
+                # Add depends_on edges where source is this seed
+                for import_edge in self.engine.edges_by_source.get(seed_id, []):
+                    if import_edge['relation'] in ('depends_on', 'module_depends_on'):
+                        target_id = import_edge['target']
+                        edge_key = (import_edge['source'], target_id, import_edge['relation'])
+
+                        # Avoid duplicates
+                        if edge_key not in seen_edge_keys and target_id in self.engine.nodes_by_id:
+                            subgraph_edges.append(import_edge)
+                            seen_edge_keys.add(edge_key)
+
+                            # Also include the imported node if not already present
+                            if target_id not in seen_node_ids:
+                                subgraph_nodes.append(self.engine.nodes_by_id[target_id])
+                                seen_node_ids.add(target_id)
 
         # Find test functions via 'tests' edges
         test_nodes = []
