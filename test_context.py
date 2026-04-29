@@ -292,27 +292,11 @@ class TestContextExtractor:
             edge_filter=edge_filter
         )
 
-        # Optionally add depends_on edges from seed nodes only (for import validation)
+        # Optionally add import edges from seeds (for import validation)
         if include_seed_imports:
-            seen_node_ids = {n['id'] for n in subgraph_nodes}
-            seen_edge_keys = {(e['source'], e['target'], e['relation']) for e in subgraph_edges}
-
-            for seed_id in seed_ids:
-                # Add depends_on edges where source is this seed
-                for import_edge in self.engine.edges_by_source.get(seed_id, []):
-                    if import_edge['relation'] in ('depends_on', 'module_depends_on'):
-                        target_id = import_edge['target']
-                        edge_key = (import_edge['source'], target_id, import_edge['relation'])
-
-                        # Avoid duplicates
-                        if edge_key not in seen_edge_keys and target_id in self.engine.nodes_by_id:
-                            subgraph_edges.append(import_edge)
-                            seen_edge_keys.add(edge_key)
-
-                            # Also include the imported node if not already present
-                            if target_id not in seen_node_ids:
-                                subgraph_nodes.append(self.engine.nodes_by_id[target_id])
-                                seen_node_ids.add(target_id)
+            subgraph_nodes, subgraph_edges = self._add_seed_imports(
+                seed_ids, subgraph_nodes, subgraph_edges
+            )
 
         # Find test functions via 'tests' edges
         test_nodes = []
@@ -335,6 +319,47 @@ class TestContextExtractor:
             repo=instance['repo'],
             base_commit=instance['base_commit'],
         )
+
+    def _add_seed_imports(
+        self,
+        seed_ids: List[str],
+        nodes: List[Dict],
+        edges: List[Dict],
+    ) -> tuple:
+        """Add depends_on edges from seed nodes only (for import validation).
+
+        Includes import edges where the source is a seed node. This enables
+        validation rules to check whether seeds use things they import, without
+        bloating the subgraph with all module dependencies.
+
+        Args:
+            seed_ids: List of seed node IDs to extract imports from
+            nodes: Subgraph node list (will be extended with imported modules)
+            edges: Subgraph edge list (will be extended with import edges)
+
+        Returns:
+            (nodes, edges) with import edges added
+        """
+        seen_node_ids = {n['id'] for n in nodes}
+        seen_edge_keys = {(e['source'], e['target'], e['relation']) for e in edges}
+
+        for seed_id in seed_ids:
+            for import_edge in self.engine.edges_by_source.get(seed_id, []):
+                if import_edge['relation'] in ('depends_on', 'module_depends_on'):
+                    target_id = import_edge['target']
+                    edge_key = (import_edge['source'], target_id, import_edge['relation'])
+
+                    # Avoid duplicates and ensure target exists
+                    if edge_key not in seen_edge_keys and target_id in self.engine.nodes_by_id:
+                        edges.append(import_edge)
+                        seen_edge_keys.add(edge_key)
+
+                        # Also include the imported node if not already present
+                        if target_id not in seen_node_ids:
+                            nodes.append(self.engine.nodes_by_id[target_id])
+                            seen_node_ids.add(target_id)
+
+        return nodes, edges
 
     def _bfs(
         self,
@@ -398,7 +423,9 @@ class TestContextExtractor:
                 if edge['relation'] not in edge_filter:
                     continue
 
-                source_id = edge['source']
+                # TODO: need to finalise directionality of edges in the KG. 
+                # TODO: Im not sure if imports should be source->target or if sometimes target->source.
+                source_id = edge['source'] 
                 edge_key = (source_id, edge['target'], edge['relation'])
 
                 if edge_key not in visited_edges and source_id in self.engine.nodes_by_id:
