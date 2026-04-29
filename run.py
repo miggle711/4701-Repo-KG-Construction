@@ -30,7 +30,7 @@ from pathlib import Path
 from repo_kg_builder import RepoKGBuilder
 from kg_query import KGQueryEngine
 from test_context import TestContextExtractor
-from test_context_validator import TestContextValidator
+from subgraph_validator import TestContextValidator
 
 
 def _load_or_build(builder, repo, commit):
