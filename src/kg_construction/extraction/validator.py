@@ -14,7 +14,7 @@ Errors block use; warnings flag issues to monitor.
 from typing import Dict, List, Set, Tuple
 from collections import defaultdict
 
-from test_context import TestContext
+from kg_construction.extraction.context import TestContext
 
 
 class TestContextValidator:

@@ -50,9 +50,9 @@ from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Set, Optional, Tuple, Union
 
 # Re-exported from ast_helpers so test code and external callers can still
-# `from repo_kg_builder import _get_signature` etc. without knowing about
+# `from kg_construction.kg.builder import _get_signature` etc. without knowing about
 # the split. These are imported as names (not *) so linters resolve them.
-from ast_helpers import (
+from kg_construction.ast.helpers import (
     _make_id,
     _is_test_file,
     _safe_unparse,
@@ -76,7 +76,7 @@ from ast_helpers import (
     _build_func_metadata,
     _collect_file_level_info,
 )
-from repo_manager import RepoManager
+from kg_construction.kg.repo_manager import RepoManager
 
 
 # Directories to skip during repo traversal — typically non-source content

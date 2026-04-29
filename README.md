@@ -7,15 +7,18 @@ Designed as a foundation for test generation using SWE-bench data.
 ## Quick Start
 
 ```bash
-pip install datasets pyvis
+pip install -e .
+pip install datasets pyvis  # optional: for datasets, visualizations
 python3 run.py
 ```
 
-`run.py` loads SWE-bench Lite, lists available repos, prompts for one, and builds its KG.
+`run.py` is a CLI that guides you through: repo selection, commit SHA, patch file, and file paths. It extracts a KG subgraph and validates it for LLM test generation.
 
 ```python
-from repo_kg_builder import RepoKGBuilder
-from kg_query import KGQueryEngine
+from kg_construction.kg.builder import RepoKGBuilder
+from kg_construction.kg.query import KGQueryEngine
+from kg_construction.extraction.context import TestContextExtractor
+from kg_construction.extraction.validator import TestContextValidator
 import json
 
 # Build from a specific commit
@@ -37,18 +40,49 @@ print(contents['classes'], contents['functions'])
 # Find what calls a function
 callers = engine.find_callers(contents['functions'][0]['id'])
 
+# Extract a subgraph for test generation
+instance = {
+    'repo': 'psf/requests',
+    'base_commit': 'a0df2cbb',
+    'patch': '...',  # unified diff
+    'code_file': 'requests/sessions.py',
+    'test_file': 'tests/test_sessions.py',
+}
+
+extractor = TestContextExtractor(engine)
+context = extractor.extract(instance, depth=2)
+
+# Validate the subgraph
+validator = TestContextValidator(context)
+is_valid, report = validator.validate()
+print(report)
+
 # Visualise a subgraph in the browser
 engine.visualize([files[0]['id']], depth=2, output_path='sessions.html')
 ```
 
-## Files
+## Package Structure
 
-| File | Purpose |
-|------|---------|
-| `repo_kg_builder.py` | Clone repo, parse AST, emit KG nodes and edges |
-| `kg_query.py` | In-memory query engine and pyvis visualisation |
-| `run.py` | Interactive entry point using SWE-bench Lite |
-| `test_kg_builder.py` | Unit and integration tests (no git clone needed) |
+```text
+src/kg_construction/
+├── kg/
+│   ├── builder.py       # Clone repo, parse AST, emit KG nodes and edges
+│   ├── query.py         # In-memory query engine and pyvis visualisation
+│   ├── validator.py     # Full KG validation (post-extraction sanity checks)
+│   └── repo_manager.py  # Git clone and archive extraction
+├── ast/
+│   └── helpers.py       # Pure AST-in/data-out utilities (22 helper functions)
+├── extraction/
+│   ├── context.py       # Subgraph extraction (TestContext, TestContextExtractor)
+│   └── validator.py     # Subgraph validation for LLM test generation
+└── pipeline.py          # Extract and validate orchestration (extract_and_validate)
+
+run.py                   # CLI shim (thin wrapper around pipeline.py)
+tests/
+├── unit/                # Unit tests for AST helpers and KG builder
+├── integration/         # Integration tests with real KGs
+└── e2e/                 # End-to-end pipeline tests
+```
 
 ## Graph Structure
 
@@ -114,19 +148,36 @@ engine.visualize([node_id], depth=2, output_path='graph.html')
 ## Running Tests
 
 ```bash
-python3 test_kg_builder.py -v
+# Install in editable mode first
+pip install -e .
+
+# Run unit tests
+python3 tests/unit/test_kg_builder.py -v
+python3 tests/unit/test_subgraph_validator.py -v
+
+# Run integration tests (requires pre-built KGs in kg_output/)
+python3 tests/integration/test_subgraph_validator_integration.py -v
+
+# Run all tests with pytest (if available)
+pytest tests/ -v
 ```
 
-Tests run entirely on synthetic Python source — no git clone or network access required. 35 tests covering all helper functions and edge types end-to-end through `parse_repo`.
+**Unit tests** run entirely on synthetic Python source — no git clone or network access required. 35+ tests covering all AST helpers and edge types end-to-end through the KG builder.
+
+**Integration tests** validate real subgraph extraction and validation with pre-built KGs (skipped gracefully if KGs not present).
 
 ## Installation
 
 ```bash
-pip install datasets   # for run.py / SWE-bench data
-pip install pyvis      # for visualize()
+# Install the package in editable mode
+pip install -e .
+
+# Optional dependencies
+pip install datasets   # for datasets, run.py examples
+pip install pyvis      # for engine.visualize()
 ```
 
-No other dependencies beyond the Python standard library.
+Core functionality requires only Python 3.10+. No other dependencies beyond the standard library.
 
 ## See Also
 
