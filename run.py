@@ -31,6 +31,7 @@ from repo_kg_builder import RepoKGBuilder
 from kg_query import KGQueryEngine
 from test_context import TestContextExtractor
 from subgraph_validator import TestContextValidator
+from full_kg_validator import KGValidator
 
 
 def _load_or_build(builder, repo, commit):
@@ -79,6 +80,17 @@ def extract_and_validate(instance, depth=2, verbose=True):
         print()
     builder = RepoKGBuilder()
     kg = _load_or_build(builder, repo, commit)
+
+    # Validate full KG structure
+    if verbose:
+        print("Validating full KG...", end=" ", flush=True)
+    kg_validator = KGValidator(kg)
+    kg_valid, kg_report = kg_validator.validate()
+    if verbose:
+        if kg_valid:
+            print("✓")
+        else:
+            print("\n" + kg_report)
 
     # Extract subgraph
     if verbose:
